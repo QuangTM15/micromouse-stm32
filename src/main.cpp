@@ -1,555 +1,673 @@
 
 #include <Arduino.h>
-#include <Wire.h>
-#include <math.h>
+
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cctype>
+#include <algorithm>
 
 #include "config.h"
-#include "motor.h"
-#include "encoder.h"
-#include "imu.h"
+#include "motion.h"
+#include "motion_config.h"
 
 // =====================================================
-// MICROMOUSE - HEADING PID TEST
-// STM32F411CEU6 + DRV8833 + ICM-20602
-//
-// Power ON -> Wait 2s
-// Straight PID 2s
-// Pause 1s
-// Turn LEFT ~90 degrees
-// Pause 1s
-// Straight PID 2s
-// STOP
+// CONFIGURATION
 // =====================================================
 
-// ================= MOTOR CONFIG =================
+constexpr uint32_t SERIAL_BAUD = 115200;
+constexpr uint32_t PRINT_INTERVAL_MS = 200;
 
-static const int BASE_PWM = 120;
-static const int TURN_PWM = 120;
+constexpr size_t COMMAND_BUFFER_SIZE = 64;
 
-static const int MIN_PWM = 100;
-static const int MAX_PWM = 150;
+// =====================================================
+// GLOBAL VARIABLES
+// =====================================================
 
-static const float HEADING_MAX_CORRECTION = 20.0f;
+bool motionReady = false;
+bool errorPrinted = false;
 
-// ================= HEADING PID =================
+uint32_t lastPrintMs = 0;
+uint32_t commandStartMs = 0;
 
-// Start with conservative gains.
-// Units:
-// KP: PWM / degree
-// KI: PWM / (degree * second)
-// KD: PWM / (degree / second)
+MotionState previousState =
+    MotionState::Uninitialized;
 
-static const float HEADING_KP = 2.0f;
-static const float HEADING_KI = 0.06f;
-static const float HEADING_KD = 0.15f;
+char commandBuffer[COMMAND_BUFFER_SIZE] = {};
+size_t commandLength = 0;
 
-static const float MAX_INTEGRAL = 25.0f;
+// =====================================================
+// MOTION STATE NAME
+// =====================================================
 
-// IMPORTANT:
-// +1 = positive gyro Z means physical LEFT turn.
-// -1 = negative gyro Z means physical LEFT turn.
-//
-// Change to -1 if PID makes left drift worse.
-static const float IMU_LEFT_SIGN = 1.0f;
-
-// ================= TIMING =================
-
-static const uint32_t START_DELAY_MS = 2000U;
-static const uint32_t STRAIGHT_MS = 2000U;
-static const uint32_t PAUSE_MS = 1000U;
-
-static const uint32_t CONTROL_MS = 20U;
-static const uint32_t TURN_TIMEOUT_MS = 3000U;
-static const uint32_t TURN_DETECT_MS = 600U;
-
-// ================= TURN CONFIG =================
-
-static const float TURN_STOP_DEG = 85.0f;
-static const float GYRO_DEADBAND = 1.0f;
-
-// ================= SAFETY =================
-
-static const float MAX_HEADING_ERROR = 35.0f;
-static const uint32_t STALL_TIMEOUT_MS = 600U;
-
-// ================= STATE =================
-
-enum TestState
+const char *stateName(MotionState state)
 {
-  WAIT_START,
-  STRAIGHT_1,
-  PAUSE_1,
-  TURN_LEFT,
-  PAUSE_2,
-  STRAIGHT_2,
-  FINISHED,
-  ERROR_STOP
-};
-
-static TestState state = WAIT_START;
-
-static uint32_t stateStartMs = 0U;
-static uint32_t lastControlMs = 0U;
-static uint32_t lastGyroUs = 0U;
-
-// ================= HEADING PID =================
-
-static float headingAngle = 0.0f;
-static float headingIntegral = 0.0f;
-static float filteredGyro = 0.0f;
-
-// ================= TURN =================
-
-static float turnAngle = 0.0f;
-static bool turnDetected = false;
-
-// ================= ENCODER WATCHDOG =================
-
-static long previousLeftTicks = 0L;
-static long previousRightTicks = 0L;
-
-static uint32_t leftMovementMs = 0U;
-static uint32_t rightMovementMs = 0U;
-
-// =====================================================
-// DEBUG
-// =====================================================
-
-void debugMessage(const char *message)
-{
-  if (Serial)
+  switch (state)
   {
-    Serial.println(message);
+  case MotionState::Uninitialized:
+    return "UNINITIALIZED";
+
+  case MotionState::Initializing:
+    return "INITIALIZING";
+
+  case MotionState::Idle:
+    return "IDLE";
+
+  case MotionState::Moving:
+    return "MOVING";
+
+  case MotionState::Turning:
+    return "TURNING";
+
+  case MotionState::Stopping:
+    return "STOPPING";
+
+  case MotionState::Settling:
+    return "SETTLING";
+
+  case MotionState::Completed:
+    return "COMPLETED";
+
+  case MotionState::Error:
+    return "ERROR";
+
+  default:
+    return "UNKNOWN";
   }
 }
 
-void printStraightResult()
+// =====================================================
+// READ PWM FROM TIM2
+// =====================================================
+
+int readLeftPwm()
 {
-  if (!Serial)
+  const uint32_t period = TIM2->ARR + 1U;
+
+  if (period == 0U)
   {
-    return;
+    return 0;
   }
 
-  long left = 0L;
-  long right = 0L;
+  const int64_t difference =
+      static_cast<int64_t>(TIM2->CCR2) -
+      static_cast<int64_t>(TIM2->CCR3);
 
-  readEncoders(left, right);
+  int pwm = static_cast<int>(
+      difference * 255 / period);
 
-  Serial.print("[RESULT] L=");
-  Serial.print(left);
+  if (board::reverseLeftMotor)
+  {
+    pwm = -pwm;
+  }
+
+  return pwm;
+}
+
+int readRightPwm()
+{
+  const uint32_t period = TIM2->ARR + 1U;
+
+  if (period == 0U)
+  {
+    return 0;
+  }
+
+  // New right motor mapping:
+  // PA3 = TIM2 CH4 (PWM)
+  // PA4 = GPIO (direction)
+
+  const int duty = std::clamp(
+      static_cast<int>(
+          static_cast<uint64_t>(TIM2->CCR4) *
+          255U / period),
+      0,
+      255);
+
+  const bool in4High =
+      digitalRead(board::rightIn2) == HIGH;
+
+  // DRV8833:
+  // IN4 LOW  -> forward PWM
+  // IN4 HIGH -> reverse via inverted PWM
+  int pwm = in4High ? duty - 255 : duty;
+
+  if (board::reverseRightMotor)
+  {
+    pwm = -pwm;
+  }
+
+  return pwm;
+}
+
+// =====================================================
+// PRINT MOTOR PWM
+// =====================================================
+
+void printMotorPwm()
+{
+  const bool enabled =
+      digitalRead(board::motorSleep) == HIGH;
+
+  Serial.print(" PWM_L=");
+  Serial.print(readLeftPwm());
+
+  Serial.print(" PWM_R=");
+  Serial.print(readRightPwm());
+
+  Serial.print(" ENABLE=");
+  Serial.print(enabled ? 1 : 0);
+}
+
+// =====================================================
+// PRINT TELEMETRY
+// =====================================================
+
+void printTelemetry()
+{
+  const MotionStatus status = motionGetStatus();
+
+  const MotionEncoderData encoder =
+      motionGetEncoderData();
+
+  Serial.print("[MOTION]");
+
+  Serial.print(" t=");
+  Serial.print(millis() - commandStartMs);
+
+  Serial.print(" state=");
+  Serial.print(stateName(status.state));
+
+  Serial.print(" L=");
+  Serial.print(static_cast<long>(encoder.leftCounts));
 
   Serial.print(" R=");
-  Serial.print(right);
+  Serial.print(static_cast<long>(encoder.rightCounts));
 
-  Serial.print(" Heading=");
-  Serial.print(headingAngle, 2);
+  Serial.print(" Lmm=");
+  Serial.print(encoder.leftMm, 2);
 
-  Serial.println(" deg");
+  Serial.print(" Rmm=");
+  Serial.print(encoder.rightMm, 2);
+
+  Serial.print(" DIST=");
+  Serial.print(status.travelMm, 2);
+
+  Serial.print(" DIFF=");
+  Serial.print(
+      encoder.leftMm - encoder.rightMm,
+      2);
+
+  Serial.print(" YAW=");
+  Serial.print(status.headingDeg, 2);
+
+  Serial.print(" GYRO=");
+  Serial.print(status.rateDegPerSec, 2);
+
+  printMotorPwm();
+
+  Serial.print(" FAULT=");
+  Serial.println(static_cast<int>(status.fault));
 }
 
 // =====================================================
-// MOTOR
+// PID CONFIGURATION
 // =====================================================
 
-void initializeMotor()
+void printPidConfig()
 {
-  pinMode(LEFT_IN1, OUTPUT);
-  pinMode(LEFT_IN2, OUTPUT);
+  Serial.println();
+  Serial.println("========== MOTION CONFIG ==========");
 
-  pinMode(RIGHT_IN1, OUTPUT);
-  pinMode(RIGHT_IN2, OUTPUT);
+  Serial.print("Heading KP: ");
+  Serial.println(kMotionConfig.headingPid.kp, 3);
 
-  pinMode(MOTOR_SLEEP, OUTPUT);
+  Serial.print("Heading KI: ");
+  Serial.println(kMotionConfig.headingPid.ki, 3);
 
-  digitalWrite(MOTOR_SLEEP, LOW);
+  Serial.print("Heading KD: ");
+  Serial.println(kMotionConfig.headingPid.kd, 3);
 
-  motorCoast();
-}
+  Serial.print("Straight PWM: ");
+  Serial.println(kMotionConfig.straightBasePwm);
 
-void stopMotor()
-{
-  motorCoast();
-  digitalWrite(MOTOR_SLEEP, LOW);
-}
+  Serial.print("Max Motor PWM: ");
+  Serial.println(kMotionConfig.maxMotorPwm);
 
-void driveMotor(int leftPWM, int rightPWM)
-{
-  digitalWrite(MOTOR_SLEEP, HIGH);
+  Serial.print("Left Counts/Rev: ");
+  Serial.println(kMotionConfig.leftCountsPerRev);
 
-  setMotors(leftPWM, rightPWM);
-}
+  Serial.print("Right Counts/Rev: ");
+  Serial.println(kMotionConfig.rightCountsPerRev);
 
-// =====================================================
-// ENCODER
-// =====================================================
-
-void initializeEncoder()
-{
-  pinMode(ENC_LEFT_A, INPUT_PULLUP);
-  pinMode(ENC_LEFT_B, INPUT_PULLUP);
-
-  pinMode(ENC_RIGHT_A, INPUT_PULLUP);
-  pinMode(ENC_RIGHT_B, INPUT_PULLUP);
-
-  resetEncoders();
-
-  attachInterrupt(
-      digitalPinToInterrupt(ENC_LEFT_A),
-      encoderLeftISR,
-      RISING);
-
-  attachInterrupt(
-      digitalPinToInterrupt(ENC_RIGHT_A),
-      encoderRightISR,
-      RISING);
+  Serial.println("===================================");
 }
 
 // =====================================================
-// IMU
+// COMMAND HELP
 // =====================================================
 
-bool initializeIMU()
+void printHelp()
 {
-  Wire.setSCL(I2C_SCL_PIN);
-  Wire.setSDA(I2C_SDA_PIN);
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println(" MICROMOUSE FULL MOTION TEST");
+  Serial.println("======================================");
 
-  Wire.begin();
-  Wire.setClock(50000);
+  Serial.println(" f       : Continuous forward");
+  Serial.println(" b       : Continuous backward");
+  Serial.println(" d 100   : Forward 100 counts");
+  Serial.println(" b 100   : Backward 100 counts");
 
-  Wire.beginTransmission(ICM_ADDR);
+  Serial.println(" l 90    : Turn left 90 degrees");
+  Serial.println(" r 90    : Turn right 90 degrees");
 
-  if (Wire.endTransmission() != 0)
+  Serial.println(" h 3     : Heading offset +3 degrees");
+  Serial.println(" h 0     : Clear heading offset");
+
+  Serial.println(" s       : Stop motion");
+  Serial.println(" x       : Emergency stop");
+
+  Serial.println(" p       : Print telemetry");
+  Serial.println(" c       : Print PID config");
+  Serial.println(" ?       : Show commands");
+
+  Serial.println();
+  Serial.println("NOTE:");
+  Serial.println("Continuous commands have no timeout.");
+  Serial.println("Send 's' to stop.");
+  Serial.println("======================================");
+}
+
+// =====================================================
+// ARGUMENT UTILITIES
+// =====================================================
+
+bool isBlank(const char *text)
+{
+  while (*text != '\0')
+  {
+    if (!std::isspace(
+            static_cast<unsigned char>(*text)))
+    {
+      return false;
+    }
+
+    ++text;
+  }
+
+  return true;
+}
+
+bool parseNumber(const char *text, float &value)
+{
+  while (std::isspace(
+      static_cast<unsigned char>(*text)))
+  {
+    ++text;
+  }
+
+  if (*text == '\0')
   {
     return false;
   }
 
-  // Existing setupImu() calibrates gyro offset.
-  // Keep the robot completely stationary here.
-  setupImu();
+  char *end = nullptr;
+
+  value = std::strtof(text, &end);
+
+  if (end == text || !std::isfinite(value))
+  {
+    return false;
+  }
+
+  while (std::isspace(
+      static_cast<unsigned char>(*end)))
+  {
+    ++end;
+  }
+
+  return *end == '\0';
+}
+
+bool parseCounts(const char *text, int32_t &value)
+{
+  float number = 0.0f;
+
+  if (!parseNumber(text, number))
+  {
+    return false;
+  }
+
+  if (number < -1000000.0f ||
+      number > 1000000.0f)
+  {
+    return false;
+  }
+
+  const int32_t converted =
+      static_cast<int32_t>(number);
+
+  if (static_cast<float>(converted) != number)
+  {
+    return false;
+  }
+
+  value = converted;
 
   return true;
 }
 
 // =====================================================
-// RESET HEADING PID
+// REPORT COMMAND
 // =====================================================
 
-void resetHeadingPID()
+void reportCommand(bool accepted)
 {
-  headingAngle = 0.0f;
-  headingIntegral = 0.0f;
-  filteredGyro = 0.0f;
+  Serial.print("[COMMAND] ");
 
-  lastGyroUs = micros();
-
-  resetEncoders();
-
-  previousLeftTicks = 0L;
-  previousRightTicks = 0L;
-
-  leftMovementMs = millis();
-  rightMovementMs = millis();
-}
-
-// =====================================================
-// STATE MACHINE
-// =====================================================
-
-void enterState(TestState next)
-{
-  if (state == STRAIGHT_1 ||
-      state == STRAIGHT_2)
+  if (accepted)
   {
-    printStraightResult();
+    Serial.println("ACCEPTED");
+
+    commandStartMs = millis();
+    lastPrintMs = commandStartMs;
+
+    printTelemetry();
   }
-
-  stopMotor();
-
-  state = next;
-  stateStartMs = millis();
-  lastControlMs = stateStartMs;
-
-  switch (next)
+  else
   {
-  case WAIT_START:
-    debugMessage("[WAIT] 2 seconds");
-    break;
-
-  case STRAIGHT_1:
-    resetHeadingPID();
-
-    driveMotor(BASE_PWM, BASE_PWM);
-
-    debugMessage("[1] STRAIGHT PID");
-    break;
-
-  case PAUSE_1:
-    debugMessage("[2] PAUSE");
-    break;
-
-  case TURN_LEFT:
-    resetEncoders();
-
-    turnAngle = 0.0f;
-    turnDetected = false;
-    lastGyroUs = micros();
-
-    driveMotor(-TURN_PWM, TURN_PWM);
-
-    debugMessage("[3] TURN LEFT");
-    break;
-
-  case PAUSE_2:
-    debugMessage("[4] PAUSE");
-    break;
-
-  case STRAIGHT_2:
-    resetHeadingPID();
-
-    driveMotor(BASE_PWM, BASE_PWM);
-
-    debugMessage("[5] STRAIGHT PID");
-    break;
-
-  case FINISHED:
-    debugMessage("[DONE] TEST FINISHED");
-    break;
-
-  case ERROR_STOP:
-    debugMessage("[ERROR] ROBOT STOPPED");
-    break;
+    Serial.println("REJECTED");
+    Serial.println(
+        "[INFO] Check Motion state and target");
   }
 }
 
 // =====================================================
-// STRAIGHT HEADING PID
+// COMMAND PROCESSOR
 // =====================================================
 
-void updateHeadingPID()
+void executeCommand(char *line)
 {
-  uint32_t nowMs = millis();
-
-  if ((uint32_t)(nowMs - stateStartMs) >= STRAIGHT_MS)
+  while (std::isspace(
+      static_cast<unsigned char>(*line)))
   {
-    if (state == STRAIGHT_1)
+    ++line;
+  }
+
+  if (*line == '\0')
+  {
+    return;
+  }
+
+  const char command =
+      static_cast<char>(
+          std::tolower(
+              static_cast<unsigned char>(*line)));
+
+  const char *argument = line + 1;
+
+  Serial.println();
+
+  // =================================================
+  // STOP
+  // =================================================
+
+  if (command == 's')
+  {
+    Serial.println("[COMMAND] STOP");
+
+    motionStop();
+
+    printTelemetry();
+    return;
+  }
+
+  // =================================================
+  // EMERGENCY STOP
+  // =================================================
+
+  if (command == 'x')
+  {
+    Serial.println("[COMMAND] EMERGENCY STOP");
+
+    motionEmergencyStop();
+
+    printTelemetry();
+    return;
+  }
+
+  // =================================================
+  // INFORMATION
+  // =================================================
+
+  if (command == 'p')
+  {
+    printTelemetry();
+    return;
+  }
+
+  if (command == 'c')
+  {
+    printPidConfig();
+    return;
+  }
+
+  if (command == '?')
+  {
+    printHelp();
+    return;
+  }
+
+  // =================================================
+  // CHECK READINESS
+  // =================================================
+
+  if (!motionReady)
+  {
+    Serial.println("[ERROR] Motion not ready");
+    return;
+  }
+
+  if (motionHasError())
+  {
+    Serial.println("[ERROR] Motion is in ERROR state");
+    Serial.println("[INFO] Reset MCU to restart");
+    return;
+  }
+
+  // =================================================
+  // F: CONTINUOUS FORWARD
+  // =================================================
+
+  if (command == 'f')
+  {
+    if (!isBlank(argument))
     {
-      enterState(PAUSE_1);
+      Serial.println("[ERROR] Use: f");
+      return;
     }
-    else
+
+    Serial.println("[COMMAND] FORWARD CONTINUOUS");
+
+    reportCommand(motionForward());
+    return;
+  }
+
+  // =================================================
+  // B: CONTINUOUS BACKWARD OR DISTANCE
+  // =================================================
+
+  if (command == 'b')
+  {
+    // No argument: continuous backward.
+    if (isBlank(argument))
     {
-      enterState(FINISHED);
+      Serial.println(
+          "[COMMAND] BACKWARD CONTINUOUS");
+
+      reportCommand(motionBackward());
+      return;
     }
 
+    // With argument: backward by counts.
+    int32_t counts = 0;
+
+    if (!parseCounts(argument, counts) ||
+        counts <= 0)
+    {
+      Serial.println(
+          "[ERROR] Use: b OR b <positive_counts>");
+      return;
+    }
+
+    Serial.print("[COMMAND] BACKWARD COUNTS=");
+    Serial.println(counts);
+
+    reportCommand(motionMoveCounts(-counts));
     return;
   }
 
-  if ((uint32_t)(nowMs - lastControlMs) < CONTROL_MS)
+  // =================================================
+  // D: FORWARD DISTANCE
+  // =================================================
+
+  if (command == 'd')
   {
+    int32_t counts = 0;
+
+    if (!parseCounts(argument, counts) ||
+        counts <= 0)
+    {
+      Serial.println(
+          "[ERROR] Use: d <positive_counts>");
+      return;
+    }
+
+    Serial.print("[COMMAND] FORWARD COUNTS=");
+    Serial.println(counts);
+
+    reportCommand(motionMoveCounts(counts));
     return;
   }
 
-  lastControlMs = nowMs;
+  // =================================================
+  // L: TURN LEFT
+  // =================================================
 
-  // ================= DELTA TIME =================
-
-  uint32_t nowUs = micros();
-
-  float dt =
-      (float)(uint32_t)(nowUs - lastGyroUs) /
-      1000000.0f;
-
-  lastGyroUs = nowUs;
-
-  if (dt <= 0.0f || dt > 0.15f)
+  if (command == 'l')
   {
-    enterState(ERROR_STOP);
+    float angle = 0.0f;
+
+    if (!parseNumber(argument, angle) ||
+        angle <= 0.0f)
+    {
+      Serial.println(
+          "[ERROR] Use: l <positive_angle>");
+      return;
+    }
+
+    Serial.print("[COMMAND] TURN LEFT ");
+    Serial.println(angle);
+
+    reportCommand(motionTurn(angle));
     return;
   }
 
-  // ================= READ GYRO =================
+  // =================================================
+  // R: TURN RIGHT
+  // =================================================
 
-  float gyroZ =
-      getGyroZRate() * IMU_LEFT_SIGN;
-
-  if (!isfinite(gyroZ))
+  if (command == 'r')
   {
-    enterState(ERROR_STOP);
+    float angle = 0.0f;
+
+    if (!parseNumber(argument, angle) ||
+        angle <= 0.0f)
+    {
+      Serial.println(
+          "[ERROR] Use: r <positive_angle>");
+      return;
+    }
+
+    Serial.print("[COMMAND] TURN RIGHT ");
+    Serial.println(angle);
+
+    reportCommand(motionTurn(-angle));
     return;
   }
 
-  // Low-pass filter gyro velocity.
-  filteredGyro =
-      0.65f * filteredGyro +
-      0.35f * gyroZ;
+  // =================================================
+  // H: HEADING OFFSET
+  // =================================================
 
-  if (fabsf(filteredGyro) < GYRO_DEADBAND)
+  if (command == 'h')
   {
-    filteredGyro = 0.0f;
-  }
+    float offset = 0.0f;
 
-  // ================= ESTIMATE HEADING =================
+    if (!parseNumber(argument, offset))
+    {
+      Serial.println(
+          "[ERROR] Use: h <degrees>");
+      return;
+    }
 
-  // Target heading = 0 degrees.
-  headingAngle += filteredGyro * dt;
+    Serial.print("[COMMAND] HEADING OFFSET=");
+    Serial.println(offset);
 
-  if (fabsf(headingAngle) > MAX_HEADING_ERROR)
-  {
-    debugMessage("[ERROR] HEADING TOO LARGE");
-    enterState(ERROR_STOP);
+    const bool accepted =
+        motionSetHeadingOffset(offset);
+
+    Serial.println(
+        accepted
+            ? "[COMMAND] ACCEPTED"
+            : "[COMMAND] REJECTED");
+
     return;
   }
 
-  // ================= INTEGRAL =================
-
-  if (fabsf(headingAngle) < 15.0f)
-  {
-    headingIntegral += headingAngle * dt;
-
-    headingIntegral = constrain(
-        headingIntegral,
-        -MAX_INTEGRAL,
-        MAX_INTEGRAL);
-  }
-
-  // ================= PID =================
-
-  float proportional =
-      HEADING_KP * headingAngle;
-
-  float integral =
-      HEADING_KI * headingIntegral;
-
-  // Gyro rate is derivative of heading.
-  float derivative =
-      HEADING_KD * filteredGyro;
-
-  float correction =
-      proportional + integral + derivative;
-
-  correction = constrain(
-      correction,
-      -HEADING_MAX_CORRECTION,
-      HEADING_MAX_CORRECTION);
-
-  // If robot turns left:
-  // increase LEFT wheel,
-  // decrease RIGHT wheel.
-  int leftPWM = constrain(
-      (int)lroundf(BASE_PWM + correction),
-      MIN_PWM,
-      MAX_PWM);
-
-  int rightPWM = constrain(
-      (int)lroundf(BASE_PWM - correction),
-      MIN_PWM,
-      MAX_PWM);
-
-  // ================= ENCODER SAFETY =================
-
-  long leftTicks = 0L;
-  long rightTicks = 0L;
-
-  readEncoders(leftTicks, rightTicks);
-
-  if (leftTicks != previousLeftTicks)
-  {
-    previousLeftTicks = leftTicks;
-    leftMovementMs = nowMs;
-  }
-
-  if (rightTicks != previousRightTicks)
-  {
-    previousRightTicks = rightTicks;
-    rightMovementMs = nowMs;
-  }
-
-  if ((uint32_t)(nowMs - leftMovementMs) >= STALL_TIMEOUT_MS ||
-      (uint32_t)(nowMs - rightMovementMs) >= STALL_TIMEOUT_MS)
-  {
-    debugMessage("[ERROR] ENCODER STALL");
-    enterState(ERROR_STOP);
-    return;
-  }
-
-  // ================= APPLY PWM =================
-
-  driveMotor(leftPWM, rightPWM);
+  Serial.println("[ERROR] Unknown command");
+  printHelp();
 }
 
 // =====================================================
-// TURN LEFT 90 DEGREES
+// NON-BLOCKING SERIAL INPUT
 // =====================================================
 
-void updateTurnLeft()
+void processSerial()
 {
-  uint32_t nowMs = millis();
-
-  uint32_t elapsedMs = nowMs - stateStartMs;
-
-  if (elapsedMs >= TURN_TIMEOUT_MS)
+  while (Serial.available() > 0)
   {
-    debugMessage("[ERROR] TURN TIMEOUT");
-    enterState(ERROR_STOP);
-    return;
+    const char received =
+        static_cast<char>(Serial.read());
+
+    if (received == '\r' || received == '\n')
+    {
+      if (commandLength > 0)
+      {
+        commandBuffer[commandLength] = '\0';
+
+        executeCommand(commandBuffer);
+
+        commandLength = 0;
+      }
+
+      continue;
+    }
+
+    if (commandLength >=
+        COMMAND_BUFFER_SIZE - 1)
+    {
+      commandLength = 0;
+
+      Serial.println(
+          "[ERROR] Command too long");
+
+      continue;
+    }
+
+    commandBuffer[commandLength++] = received;
   }
-
-  if ((uint32_t)(nowMs - lastControlMs) < CONTROL_MS)
-  {
-    return;
-  }
-
-  lastControlMs = nowMs;
-
-  uint32_t nowUs = micros();
-
-  float dt =
-      (float)(uint32_t)(nowUs - lastGyroUs) /
-      1000000.0f;
-
-  lastGyroUs = nowUs;
-
-  if (dt <= 0.0f || dt > 0.15f)
-  {
-    enterState(ERROR_STOP);
-    return;
-  }
-
-  float gyroZ = getGyroZRate();
-
-  if (!isfinite(gyroZ))
-  {
-    enterState(ERROR_STOP);
-    return;
-  }
-
-  float angularSpeed = fabsf(gyroZ);
-
-  if (angularSpeed < GYRO_DEADBAND)
-  {
-    angularSpeed = 0.0f;
-  }
-
-  if (angularSpeed >= 5.0f)
-  {
-    turnDetected = true;
-  }
-
-  if (elapsedMs >= TURN_DETECT_MS && !turnDetected)
-  {
-    debugMessage("[ERROR] NO TURN DETECTED");
-    enterState(ERROR_STOP);
-    return;
-  }
-
-  turnAngle += angularSpeed * dt;
-
-  if (turnAngle >= TURN_STOP_DEG)
-  {
-    enterState(PAUSE_2);
-    return;
-  }
-
-  driveMotor(-TURN_PWM, TURN_PWM);
 }
 
 // =====================================================
@@ -558,77 +676,128 @@ void updateTurnLeft()
 
 void setup()
 {
-  // Disable motor immediately.
-  initializeMotor();
+  Serial.begin(SERIAL_BAUD);
 
-  Serial.begin(115200);
+  const uint32_t serialStart = millis();
 
-  initializeEncoder();
-
-  if (!initializeIMU())
+  while (!Serial &&
+         millis() - serialStart < 5000)
   {
-    stopMotor();
-    state = ERROR_STOP;
-
-    debugMessage("[ERROR] IMU NOT DETECTED");
-    return;
+    delay(10);
   }
 
-  stopMotor();
+  Serial.println();
+  Serial.println("======================================");
+  Serial.println(" MICROMOUSE FULL MOTION TEST");
+  Serial.println(" STM32F411CEU6");
+  Serial.println("======================================");
 
-  debugMessage("==========================");
-  debugMessage(" MICROMOUSE HEADING PID");
-  debugMessage("==========================");
+  Serial.println("[INIT] Starting Motion...");
 
-  // Countdown starts after IMU calibration.
-  enterState(WAIT_START);
+  const bool accepted = motionInit();
+
+  if (!accepted)
+  {
+    Serial.println(
+        "[ERROR] Motion initialization failed");
+  }
+
+  printHelp();
+
+  Serial.println();
+  Serial.println("[SYSTEM] Waiting for IMU calibration");
 }
 
 // =====================================================
-// LOOP
+// MAIN LOOP
 // =====================================================
 
 void loop()
 {
-  uint32_t nowMs = millis();
+  // =============================================
+  // MOTION UPDATE
+  // =============================================
 
-  switch (state)
+  motionUpdate();
+
+  // =============================================
+  // SERIAL COMMANDS
+  // =============================================
+
+  processSerial();
+
+  const uint32_t now = millis();
+
+  const MotionStatus status =
+      motionGetStatus();
+
+  // =============================================
+  // STATE CHANGE
+  // =============================================
+
+  if (status.state != previousState)
   {
-  case WAIT_START:
-    if ((uint32_t)(nowMs - stateStartMs) >=
-        START_DELAY_MS)
+    previousState = status.state;
+
+    Serial.println();
+
+    Serial.print("[STATE] ");
+    Serial.println(stateName(status.state));
+
+    if (status.state == MotionState::Idle &&
+        !motionReady)
     {
-      enterState(STRAIGHT_1);
+      motionReady = true;
+
+      Serial.println("[INIT] Motion READY");
+      Serial.println("[INIT] IMU calibration PASS");
+      Serial.println("[READY] Enter a command");
     }
-    break;
 
-  case STRAIGHT_1:
-  case STRAIGHT_2:
-    updateHeadingPID();
-    break;
-
-  case PAUSE_1:
-    if ((uint32_t)(nowMs - stateStartMs) >= PAUSE_MS)
+    if (status.state == MotionState::Completed)
     {
-      enterState(TURN_LEFT);
+      Serial.println();
+      Serial.println("===== TARGET REACHED =====");
+
+      printTelemetry();
+
+      Serial.println(
+          "[READY] Enter next command");
     }
-    break;
 
-  case TURN_LEFT:
-    updateTurnLeft();
-    break;
-
-  case PAUSE_2:
-    if ((uint32_t)(nowMs - stateStartMs) >= PAUSE_MS)
+    if (status.state == MotionState::Error)
     {
-      enterState(STRAIGHT_2);
-    }
-    break;
+      Serial.println();
+      Serial.println("===== MOTION ERROR =====");
 
-  case FINISHED:
-  case ERROR_STOP:
-  default:
-    // Motors already disabled by enterState().
-    break;
+      printTelemetry();
+
+      errorPrinted = true;
+    }
   }
+
+  // =============================================
+  // ERROR
+  // =============================================
+
+  if (motionHasError() && !errorPrinted)
+  {
+    errorPrinted = true;
+    printTelemetry();
+  }
+
+  // =============================================
+  // CONTINUOUS TELEMETRY
+  // =============================================
+
+  if (motionIsBusy() &&
+      motionReady &&
+      now - lastPrintMs >= PRINT_INTERVAL_MS)
+  {
+    lastPrintMs = now;
+    printTelemetry();
+  }
+
+  // No automatic timeout.
+  // No automatic stop.
 }

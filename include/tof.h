@@ -1,7 +1,17 @@
 #pragma once
-#include "config.h"
-#include <VL53L0X.h>
-extern VL53L0X sensorFront, sensorLeft, sensorRight;
-extern uint16_t currentDistL, currentDistR;
-bool initSensor(VL53L0X &, uint8_t, uint8_t);
-void setupSensors();
+
+#include <stdint.h>
+
+enum class TofPosition { Right, Left, Front };
+enum class TofResult { Ready, Pending, Timeout, BadRange, BusError, Unavailable };
+enum class TofInitResult { Off, Pending, Ready, Failed };
+
+namespace tof
+{
+// Initialize after I2C setup. Service only with motion disarmed.
+void begin();
+TofInitResult updateInit();
+void shutdown();
+// Foreground only. Writes millimeters only on Ready.
+TofResult poll(TofPosition position, uint16_t& millimeters);
+}
