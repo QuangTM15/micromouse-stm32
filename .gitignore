@@ -1,0 +1,77 @@
+
+# ==================================================
+# MICROMOUSE - GITIGNORE
+# ==================================================
+
+# PlatformIO
+.pio/
+.pio-home/
+.pioenvs/
+.piolibdeps/
+
+# VS Code
+.vscode/
+
+# Legacy code
+legacy/
+
+# Build artifacts and firmware binaries
+*.bin
+*.elf
+*.hex
+*.map
+*.o
+*.obj
+*.a
+*.d
+*.lst
+*.dis
+*.su
+
+# Debug and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*.orig
+*.rej
+*.stackdump
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local environments
+.venv/
+venv/
+.env
+.env.local
+.env.*
+
+# AI agent temporary files
+.codex/
+.claude/
+.cursor/
+.aider*
+.ai-cache/
+.ai-temp/
+.agent-cache/
+
+# AI-generated temporary notes
+AGENTS.local.md
+*_AI_DRAFT.md
+*_AI_NOTES.md
+*_AI_LOG.md
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local backups
+backup/
+backups/
+*.backup
